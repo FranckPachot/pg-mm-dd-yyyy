@@ -112,7 +112,9 @@ FROM gist_page_items(
     'calendar_days_mmddyyyy_gist'::regclass
 );
 
-\echo '\nA sample of root downlinks and their actual stored keys.'
+\echo '\nA sample of root downlinks and their stored keys.'
+\echo 'Key form is ({present months},[day_lo,day_hi],[year_lo,year_hi]);'
+\echo 'the month component is a set because it is stored as a 12-bit bitmap.'
 SELECT itemoffset,
        ctid AS child_page,
        keys AS subtree_bounds

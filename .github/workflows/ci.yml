@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build extension and run the correctness suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # The Dockerfile compiles mmddyyyy against postgresql-server-dev-17 with
+      # -Wall -Wextra -Werror, so a build failure here is a compile-time defect.
+      - name: Build the PostgreSQL 17 image with the extension
+        run: docker compose build
+
+      - name: Start PostgreSQL and wait for it to become healthy
+        run: docker compose up -d --wait
+
+      # tests/test.sql runs under ON_ERROR_STOP and RAISEs on any wrong result,
+      # so a non-zero psql exit code fails the job.
+      - name: Run tests/test.sql
+        run: |
+          docker compose exec -T postgres \
+            psql -X -v ON_ERROR_STOP=1 -U postgres -d mmddyyyy_lab \
+            -f /project/tests/test.sql
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

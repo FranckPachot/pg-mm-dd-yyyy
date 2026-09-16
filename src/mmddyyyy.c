@@ -23,6 +23,18 @@ typedef struct MmDdYyyy
     char value[MMDDYYYY_LENGTH];
 } MmDdYyyy;
 
+/*
+ * The two structs below are passed by pointer as pass-by-reference SQL values,
+ * so their in-memory layout IS their on-disk layout. Each one must match the
+ * INTERNALLENGTH and ALIGNMENT declared for its type in
+ * sql/mmddyyyy--0.1.0.sql, and the StaticAssertDecl calls further down enforce
+ * that. If you add or reorder a field, update the SQL and the assertion too.
+ *
+ * MmDdYyyyPattern holds five bytes of data (int16 + three uint8). The leading
+ * int16 forces 2-byte alignment, so the compiler pads the tail to an even 6
+ * bytes; that padding is load-bearing and matches INTERNALLENGTH = 6,
+ * ALIGNMENT = int2. Keep the int16 first so the layout stays predictable.
+ */
 typedef struct MmDdYyyyPattern
 {
     int16 year;
@@ -31,15 +43,33 @@ typedef struct MmDdYyyyPattern
     uint8 mask;
 } MmDdYyyyPattern;
 
+/*
+ * MmDdYyyyGistKey is exactly eight bytes with no padding: two int16 year bounds
+ * (4 bytes), a uint16 month bitmap (2 bytes), and two uint8 day bounds
+ * (2 bytes). The leading int16 pair gives it 2-byte alignment, matching
+ * INTERNALLENGTH = 8, ALIGNMENT = int2.
+ *
+ * Year and day are ordinary linear ranges [min, max]. Month is different: the
+ * calendar is a cycle, so December and January are neighbours, and a linear
+ * [1, 12] range would be the useless "any month" box for a subtree that merely
+ * straddles the year boundary. Instead month is stored as a 12-bit presence
+ * bitmap in month_mask: bit (m - 1) is set when some descendant has month m.
+ * A bitmap makes union an exact, order-independent bitwise OR and lets the
+ * circular month distance look only at the months that are actually present.
+ * See the month_* helpers below.
+ */
 typedef struct MmDdYyyyGistKey
 {
     int16 year_min;
     int16 year_max;
-    uint8 month_min;
-    uint8 month_max;
+    uint16 month_mask;
     uint8 day_min;
     uint8 day_max;
 } MmDdYyyyGistKey;
+
+/* month_mask uses the low 12 bits, one per calendar month (bit 0 = January). */
+#define MMDDYYYY_ALL_MONTHS 0x0FFF
+#define MONTH_BIT(month) ((uint16) (1u << ((month) - 1)))
 
 typedef struct MmDdYyyyPickSplitItem
 {
@@ -442,7 +472,7 @@ key_from_mmddyyyy(MmDdYyyyGistKey *key, const MmDdYyyy *value)
     int year;
 
     unpack_mmddyyyy(value, &month, &day, &year);
-    key->month_min = key->month_max = month;
+    key->month_mask = MONTH_BIT(month);
     key->day_min = key->day_max = day;
     key->year_min = key->year_max = year;
 }
@@ -450,8 +480,8 @@ key_from_mmddyyyy(MmDdYyyyGistKey *key, const MmDdYyyy *value)
 static void
 expand_key(MmDdYyyyGistKey *target, const MmDdYyyyGistKey *addition)
 {
-    target->month_min = Min(target->month_min, addition->month_min);
-    target->month_max = Max(target->month_max, addition->month_max);
+    /* The month bitmap union is an exact, order-independent bitwise OR. */
+    target->month_mask |= addition->month_mask;
     target->day_min = Min(target->day_min, addition->day_min);
     target->day_max = Max(target->day_max, addition->day_max);
     target->year_min = Min(target->year_min, addition->year_min);
@@ -471,7 +501,7 @@ static bool
 key_matches_pattern(const MmDdYyyyGistKey *key, const MmDdYyyyPattern *pattern)
 {
     if ((pattern->mask & MMDDYYYY_PATTERN_MONTH) != 0 &&
-        (pattern->month < key->month_min || pattern->month > key->month_max))
+        (key->month_mask & MONTH_BIT(pattern->month)) == 0)
         return false;
     if ((pattern->mask & MMDDYYYY_PATTERN_DAY) != 0 &&
         (pattern->day < key->day_min || pattern->day > key->day_max))
@@ -492,19 +522,66 @@ linear_gap(int value, int lower, int upper)
     return 0;
 }
 
+/*
+ * Smallest circular distance between two months on the 1..12 cycle, so that
+ * December (12) and January (1) are one step apart, not eleven.
+ */
 static int
-month_gap(int month, int lower, int upper)
+circular_month_step(int a, int b)
+{
+    int difference = abs(a - b);
+
+    return Min(difference, 12 - difference);
+}
+
+/*
+ * Minimum circular gap from a query month to any month present in the bitmap.
+ * With a single present month this is an exact distance; with several it is the
+ * closest one, which is the lower bound every descendant of this box respects.
+ */
+static int
+month_gap(int month, uint16 month_mask)
 {
     int candidate;
     int result = 6;
 
-    for (candidate = lower; candidate <= upper; candidate++)
-    {
-        int difference = abs(month - candidate);
+    for (candidate = 1; candidate <= 12; candidate++)
+        if ((month_mask & MONTH_BIT(candidate)) != 0)
+            result = Min(result, circular_month_step(month, candidate));
 
-        result = Min(result, Min(difference, 12 - difference));
-    }
     return result;
+}
+
+/* Number of months present in the bitmap, used to score box growth. */
+static int
+month_population(uint16 month_mask)
+{
+    int candidate;
+    int count = 0;
+
+    for (candidate = 1; candidate <= 12; candidate++)
+        if ((month_mask & MONTH_BIT(candidate)) != 0)
+            count++;
+
+    return count;
+}
+
+/*
+ * A deterministic scalar representative of a month bitmap, used only to order
+ * entries during picksplit. The lowest present month is stable and, for leaf
+ * points (a single bit), is exactly that date's month, so the split still
+ * groups similar months together.
+ */
+static int
+month_sort_key(uint16 month_mask)
+{
+    int candidate;
+
+    for (candidate = 1; candidate <= 12; candidate++)
+        if ((month_mask & MONTH_BIT(candidate)) != 0)
+            return candidate;
+
+    return 0;
 }
 
 static double
@@ -513,7 +590,7 @@ key_distance(const MmDdYyyyGistKey *key, const MmDdYyyyPattern *pattern)
     double result = 0.0;
 
     if ((pattern->mask & MMDDYYYY_PATTERN_MONTH) != 0)
-        result += month_gap(pattern->month, key->month_min, key->month_max) *
+        result += month_gap(pattern->month, key->month_mask) *
                   MONTH_DISTANCE_WEIGHT;
     if ((pattern->mask & MMDDYYYY_PATTERN_DAY) != 0)
         result += linear_gap(pattern->day, key->day_min, key->day_max);
@@ -532,7 +609,14 @@ key_span(const MmDdYyyyGistKey *key)
 {
     int year_span = key->year_max - key->year_min;
 
-    return (key->month_max - key->month_min) * MONTH_DISTANCE_WEIGHT +
+    /*
+     * Month spread is the count of distinct months in the box. A box holding
+     * only December and January scores 2 here, whereas the old linear
+     * month_max - month_min gave 11 and made the year-boundary box look as bad
+     * as one that truly spanned the whole year. Keeping the month term
+     * dominant (weight 32) still steers penalty and split toward tight months.
+     */
+    return month_population(key->month_mask) * MONTH_DISTANCE_WEIGHT +
            (key->day_max - key->day_min) +
            (double) year_span / ((double) year_span + 1.0);
 }
@@ -576,11 +660,31 @@ Datum
 mmddyyyy_gkey_out(PG_FUNCTION_ARGS)
 {
     MmDdYyyyGistKey *key = (MmDdYyyyGistKey *) PG_GETARG_POINTER(0);
+    StringInfoData output;
+    int month;
+    bool first = true;
 
-    PG_RETURN_CSTRING(psprintf("([%d,%d],[%d,%d],[%d,%d])",
-                              key->month_min, key->month_max,
-                              key->day_min, key->day_max,
-                              key->year_min, key->year_max));
+    /*
+     * Render as ({present months},[day_lo,day_hi],[year_lo,year_hi]). The month
+     * component is a set rather than a range because it is stored as a bitmap;
+     * for example a December/January box prints "{1,12}", not "[1,12]".
+     */
+    initStringInfo(&output);
+    appendStringInfoChar(&output, '(');
+    appendStringInfoChar(&output, '{');
+    for (month = 1; month <= 12; month++)
+        if ((key->month_mask & MONTH_BIT(month)) != 0)
+        {
+            if (!first)
+                appendStringInfoChar(&output, ',');
+            appendStringInfo(&output, "%d", month);
+            first = false;
+        }
+    appendStringInfo(&output, "},[%d,%d],[%d,%d])",
+                     key->day_min, key->day_max,
+                     key->year_min, key->year_max);
+
+    PG_RETURN_CSTRING(output.data);
 }
 
 PG_FUNCTION_INFO_V1(mmddyyyy_gist_consistent);
@@ -697,7 +801,7 @@ mmddyyyy_gist_picksplit(PG_FUNCTION_ARGS)
     {
         MmDdYyyyGistKey *key = (MmDdYyyyGistKey *)
                           DatumGetPointer(entry_vector->vector[index].key);
-        int month_center = key->month_min + key->month_max;
+        int month_center = month_sort_key(key->month_mask);
         int day_center = key->day_min + key->day_max;
 
         month_center_min = Min(month_center_min, month_center);
@@ -713,7 +817,7 @@ mmddyyyy_gist_picksplit(PG_FUNCTION_ARGS)
     for (index = 0; index < max_offset; index++)
     {
         MmDdYyyyGistKey *key = items[index].key;
-        int month_center = key->month_min + key->month_max;
+        int month_center = month_sort_key(key->month_mask);
         int day_center = key->day_min + key->day_max;
         int year_center = key->year_min + key->year_max;
 
@@ -806,11 +910,12 @@ mmddyyyy_gist_fetch(PG_FUNCTION_ARGS)
     GISTENTRY *result = palloc(sizeof(GISTENTRY));
     char output[MMDDYYYY_LENGTH + 1];
 
-    Assert(key->month_min == key->month_max);
+    /* A leaf point has exactly one month bit and collapsed day/year ranges. */
+    Assert(month_population(key->month_mask) == 1);
     Assert(key->day_min == key->day_max);
     Assert(key->year_min == key->year_max);
     snprintf(output, sizeof(output), "%02d/%02d/%04d",
-             key->month_min, key->day_min, key->year_min);
+             month_sort_key(key->month_mask), key->day_min, key->year_min);
     memcpy(value->value, output, MMDDYYYY_LENGTH);
     gistentryinit(*result, PointerGetDatum(value),
                   entry->rel, entry->page, entry->offset, false);

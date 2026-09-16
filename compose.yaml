@@ -1,0 +1,16 @@
+services:
+  postgres:
+    build: .
+    image: orahome-mdydate:pg17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mdydate_lab
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mdydate_lab"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - ./:/project:ro
+    ports:
+      - "55436:5432"

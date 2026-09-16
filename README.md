@@ -65,25 +65,29 @@ The heap retains `09/15/2026`; the B-tree stores the derived `date`. This
 supports equality, chronological ranges, and chronological sorting without C
 code or a custom access method.
 
-Component expression indexes are also enough for month-first lookup:
+For month-first lookup, indexing the fixed-width text itself is sufficient:
 
 ```sql
-CREATE INDEX events_text_month_day_year_idx
-ON events_text (
-    (substring(happened_on FROM 1 FOR 2)::integer),
-    (substring(happened_on FROM 4 FOR 2)::integer),
-    (substring(happened_on FROM 7 FOR 4)::integer)
-);
+CREATE INDEX events_text_month_first_idx
+ON events_text (happened_on text_pattern_ops);
+
+SELECT *
+FROM events_text
+WHERE happened_on LIKE '09/%';
 ```
 
-That B-tree supports month, month plus day, and the complete tuple through its
-leftmost prefixes. A day-only query needs another index because day is not the
-leading key.
+Because every value has the fixed width `MM/DD/YYYY`, anchored patterns such as
+`LIKE '09/%'` and `LIKE '09/15/%'` are leftmost-prefix searches that this
+B-tree can support. Full-value equality uses it too. A day-only query needs
+another index because day is not the leading text component. For chronological
+lookup by date, use the `us_text_to_date(happened_on)` expression index above.
 
 For production, stop here, or better, store `date` and format it for display.
 The rest of this project exists to expose PostgreSQL's extensibility.
 
 ## 2. Why take `MM/DD/YYYY` seriously?
+
+While `MM/DD/YYYY` is very common because it is used in the United States, it is far from being a standard:
 
 ![Map highlighting countries that use the MM/DD/YYYY date format](terriblemap.png)
 
@@ -134,15 +138,15 @@ forms, not one tidy invention story.
 MIT's International Students Office presents inheritance from older British
 month-first usage as [one hypothesis](https://iso.mit.edu/americanisms/date-format-in-the-united-states/),
 not established fact. This project does **not** claim Americans chose the order
-for multidimensional search. That is our new interpretation.
-
-Month can genuinely be the most significant component for seasonal demand,
-weather, maintenance, birthdays, anniversaries, school terms, or recurring
-campaigns. "Some day in September" often conveys more than "the 15th of some
-unknown month." The project turns that observation into a search policy:
-month, then day, then year.
+for multidimensional search. That is our new interpretation: "some day in
+September" can convey more than "the 15th of some unknown month." The project
+turns that observation into a search policy: month, then day, then year.
 
 ## 3. What if it were a native type?
+
+PostgreSQL was designed for extensibility: custom data types can represent
+complex values and support native storage and indexing, rather than layering
+domain semantics on top of existing types.
 
 The extension adds `mmddyyyy`, whose physical value is exactly the ten displayed
 ASCII bytes:

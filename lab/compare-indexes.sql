@@ -2,18 +2,18 @@
 \pset pager off
 \timing on
 
-CREATE EXTENSION IF NOT EXISTS mdydate;
+CREATE EXTENSION IF NOT EXISTS mmddyyyy;
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 
 DROP TABLE IF EXISTS calendar_days;
 CREATE TABLE calendar_days (
     id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    happened_on mdydate NOT NULL
+    happened_on mmddyyyy NOT NULL
 );
 
-\echo '\nGenerate the complete mdydate domain: 0001-01-01 through 9999-12-31.'
+\echo '\nGenerate the complete mmddyyyy domain: 0001-01-01 through 9999-12-31.'
 INSERT INTO calendar_days (happened_on)
-SELECT generated_at::date::mdydate
+SELECT generated_at::date::mmddyyyy
 FROM generate_series(
     date '0001-01-01',
     date '9999-12-31',
@@ -32,11 +32,11 @@ END
 $assert$;
 
 \echo '\nOne compound B-tree, ordered month then day then year.'
-CREATE INDEX calendar_days_mdy_btree
+CREATE INDEX calendar_days_mmddyyyy_btree
 ON calendar_days (
-    mdydate_month(happened_on),
-    mdydate_day(happened_on),
-    mdydate_year(happened_on)
+    mmddyyyy_month(happened_on),
+    mmddyyyy_day(happened_on),
+    mmddyyyy_year(happened_on)
 )
 INCLUDE (happened_on);
 
@@ -44,7 +44,7 @@ VACUUM (ANALYZE, FREEZE) calendar_days;
 
 \echo '\nB-tree metadata: level 0 is a leaf; higher levels contain separator keys.'
 SELECT root, level, fastroot, fastlevel
-FROM bt_metap('calendar_days_mdy_btree');
+FROM bt_metap('calendar_days_mmddyyyy_btree');
 
 \echo '\nB-TREE PHASE: GiST does not exist yet, making each chosen index unambiguous.'
 \echo 'INCLUDE makes the expression B-tree covering without changing its M/D/Y search order.'
@@ -57,35 +57,35 @@ SET enable_bitmapscan = off;
 EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
 SELECT count(*)
 FROM calendar_days
-WHERE mdydate_month(happened_on) = 9;
+WHERE mmddyyyy_month(happened_on) = 9;
 
 \echo '\nB-tree B: day = 15. With no month equality, the tree must cross every month range.'
 EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
 SELECT count(*)
 FROM calendar_days
-WHERE mdydate_day(happened_on) = 15;
+WHERE mmddyyyy_day(happened_on) = 15;
 
 \echo '\nB-tree C: day = 15 and year = 2026. It still lacks the leading month key.'
 EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
 SELECT count(*)
 FROM calendar_days
-WHERE mdydate_day(happened_on) = 15
-  AND mdydate_year(happened_on) = 2026;
+WHERE mmddyyyy_day(happened_on) = 15
+  AND mmddyyyy_year(happened_on) = 2026;
 
 \echo '\nB-tree D: exact date. All three ordered keys are constrained.'
 EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
 SELECT count(*)
 FROM calendar_days
-WHERE mdydate_month(happened_on) = 9
-  AND mdydate_day(happened_on) = 15
-  AND mdydate_year(happened_on) = 2026;
+WHERE mmddyyyy_month(happened_on) = 9
+  AND mmddyyyy_day(happened_on) = 15
+  AND mmddyyyy_year(happened_on) = 2026;
 
 RESET max_parallel_workers_per_gather;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
 \echo '\nBuild one multidimensional GiST over the same three logical components.'
-CREATE INDEX calendar_days_mdy_gist
+CREATE INDEX calendar_days_mmddyyyy_gist
 ON calendar_days USING gist (happened_on);
 
 \echo '\nTable and index sizes. The B-tree INCLUDE payload makes it a fair covering scan.'
@@ -96,20 +96,20 @@ SELECT relname,
 FROM pg_class
 WHERE oid IN (
     'calendar_days'::regclass,
-    'calendar_days_mdy_btree'::regclass,
-    'calendar_days_mdy_gist'::regclass
+    'calendar_days_mmddyyyy_btree'::regclass,
+    'calendar_days_mmddyyyy_gist'::regclass
 )
 ORDER BY relkind, relname;
 
 \echo '\nGiST block 0 is the root. With millions of rows it is an internal page.'
 SELECT *
-FROM gist_page_opaque_info(get_raw_page('calendar_days_mdy_gist', 0));
+FROM gist_page_opaque_info(get_raw_page('calendar_days_mmddyyyy_gist', 0));
 
 \echo '\nThe root has one tuple per child page; each key is that child subtree bounding box.'
 SELECT count(*) AS root_downlinks
 FROM gist_page_items(
-    get_raw_page('calendar_days_mdy_gist', 0),
-    'calendar_days_mdy_gist'::regclass
+    get_raw_page('calendar_days_mmddyyyy_gist', 0),
+    'calendar_days_mmddyyyy_gist'::regclass
 );
 
 \echo '\nA sample of root downlinks and their actual stored keys.'
@@ -117,8 +117,8 @@ SELECT itemoffset,
        ctid AS child_page,
        keys AS subtree_bounds
 FROM gist_page_items(
-    get_raw_page('calendar_days_mdy_gist', 0),
-    'calendar_days_mdy_gist'::regclass
+    get_raw_page('calendar_days_mmddyyyy_gist', 0),
+    'calendar_days_mmddyyyy_gist'::regclass
 )
 ORDER BY itemoffset
 LIMIT 12;

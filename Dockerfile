@@ -5,7 +5,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Makefile mdydate.control ./
+COPY Makefile mmddyyyy.control ./
 COPY sql/ ./sql/
 COPY src/ ./src/
 RUN make \
@@ -13,5 +13,5 @@ RUN make \
 
 FROM postgres:17-bookworm
 
-COPY --from=build /install/usr/lib/postgresql/17/lib/mdydate.so /usr/lib/postgresql/17/lib/
+COPY --from=build /install/usr/lib/postgresql/17/lib/mmddyyyy.so /usr/lib/postgresql/17/lib/
 COPY --from=build /install/usr/share/postgresql/17/extension/ /usr/share/postgresql/17/extension/

@@ -1,12 +1,24 @@
-# mdydate: the month-first GiST lab
+# pg-mm-dd-yyyy: the month-first GiST lab
 
-`mdydate` is an academic PostgreSQL extension for learning how expression
+`mmddyyyy` is an academic PostgreSQL extension for learning how expression
 indexes, base types, operators, B-tree operator classes, and GiST operator
 classes fit together. The constraint is unusual on purpose: the table must keep
 a date literally as fixed-width US-style text, `MM/DD/YYYY`.
 
-⚠️ This is not a recommendation to replace PostgreSQL's built-in `date`. We start
-with the production answer, then deliberately continue into extension code.
+The goal is not to promote storing dates as fragmented strings, but to use an
+intentionally awkward representation to understand GiST indexes. A B-tree
+organizes keys along one global order. For fixed-width text dates, that order
+suits a chronological `YYYY-MM-DD` representation. GiST instead lets an
+operator class define multidimensional summary keys for internal nodes. Here,
+those summaries bound month, day, and year independently, allowing one index to
+search efficiently by any combination of components. For seasonal searches,
+this model offers a way to reinterpret the month-first `MM/DD/YYYY` format:
+month can matter more than year or the exact day.
+
+⚠️ This is not a recommendation to replace PostgreSQL's built-in `date`, which
+provides date semantics and validation. When an application treats a date as
+more than a point on a timeline and needs attributes such as month, year, day
+of the week, or holiday status, a date dimension table may be appropriate.
 
 ## 1. The obvious solution: an expression index
 
@@ -73,10 +85,33 @@ The rest of this project exists to expose PostgreSQL's extensibility.
 
 ## 2. Why take `MM/DD/YYYY` seriously?
 
+![Map highlighting countries that use the MM/DD/YYYY date format](terriblemap.png)
+
 The usual joke is that the US format is "not ordered on anything." It is not
 chronologically ordered: string sorting groups all Januaries, then all
 Februaries, while years jump backward and forward. But it *is* ordered on
 something: month first, day second, year last.
+
+### When month and day answer the question
+
+Suppose a vineyard records harvest dates for each grape variety across many
+vintages. To ask **which varieties tend to be harvested latest in the
+season?**, the month and day matter before the year. Ordering by year first
+would primarily separate vintages; ordering by month and day first compares
+where each harvest falls within the growing season, while the year identifies
+the vintage. For this question, the dimension order behind `MM/DD/YYYY` is
+meaningful.
+
+Birthdays have the same shape. When looking for two people who share a
+birthday, matching the month and day matters; the birth year is secondary and
+may be deliberately ignored. Anniversaries, recurring holidays, seasonal
+maintenance, and similar events also emphasize a position within the year
+rather than one point on a global timeline.
+
+These examples justify treating month, day, and year as independently
+searchable dimensions. They do not imply that text order should control every
+index: this extension's B-tree remains chronological, while its GiST operator
+class exposes the components needed for seasonal and partial-date questions.
 
 `MM/DD/YYYY` is a conventional US numeric format, not the international
 standard. The [W3C date-format note](https://www.w3.org/International/questions/qa-date-format.en.html)
@@ -109,13 +144,13 @@ month, then day, then year.
 
 ## 3. What if it were a native type?
 
-The extension adds `mdydate`, whose physical value is exactly the ten displayed
+The extension adds `mmddyyyy`, whose physical value is exactly the ten displayed
 ASCII bytes:
 
 ```sql
-SELECT '09/15/2026'::mdydate AS value,
-       pg_column_size('09/15/2026'::mdydate) AS bytes,
-       '09/15/2026'::mdydate::date AS native_date;
+SELECT '09/15/2026'::mmddyyyy AS value,
+       pg_column_size('09/15/2026'::mmddyyyy) AS bytes,
+       '09/15/2026'::mmddyyyy::date AS native_date;
 ```
 
 ```text
@@ -130,7 +165,7 @@ and from `date`, component accessors, comparison operators, and a default
 B-tree operator class. The next sections motivate the partial-matching and
 similarity operations before introducing their symbols and GiST support.
 
-### An ordinary B-tree syntax, but a custom ordering
+### Ordinary B-tree syntax, but custom ordering
 
 This is **not** a plain-text B-tree that somehow discovers the year at the end
 of the string. A PostgreSQL B-tree does not decide how values compare by itself.
@@ -147,21 +182,21 @@ SELECT '12/31/2025'::text < '01/01/2026'::text; -- false
 That result is not chronological. The first character `1` sorts after `0`
 before PostgreSQL ever reaches the year.
 
-For `mdydate`, the extension declares `mdydate_btree_ops` as the **default
+For `mmddyyyy`, the extension declares `mmddyyyy_btree_ops` as the **default
 B-tree operator class**:
 
 ```sql
-CREATE OPERATOR CLASS mdydate_btree_ops
-DEFAULT FOR TYPE mdydate USING btree AS
+CREATE OPERATOR CLASS mmddyyyy_btree_ops
+DEFAULT FOR TYPE mmddyyyy USING btree AS
   OPERATOR 1 <,
   OPERATOR 2 <=,
   OPERATOR 3 =,
   OPERATOR 4 >=,
   OPERATOR 5 >,
-  FUNCTION 1 mdydate_cmp(mdydate, mdydate);
+  FUNCTION 1 mmddyyyy_cmp(mmddyyyy, mmddyyyy);
 ```
 
-Support function 1 is the B-tree comparator. `mdydate_cmp` reads the month,
+Support function 1 is the B-tree comparator. `mmddyyyy_cmp` reads the month,
 day, and year from each ten-byte value, but compares them in the order year,
 month, day:
 
@@ -176,10 +211,10 @@ return 0;
 ```
 
 Therefore the same visible spellings have different semantics once cast to
-`mdydate`:
+`mmddyyyy`:
 
 ```sql
-SELECT '12/31/2025'::mdydate < '01/01/2026'::mdydate; -- true
+SELECT '12/31/2025'::mmddyyyy < '01/01/2026'::mmddyyyy; -- true
 ```
 
 The index is then created with ordinary SQL syntax:
@@ -187,7 +222,7 @@ The index is then created with ordinary SQL syntax:
 ```sql
 CREATE TABLE events (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    happened_on mdydate NOT NULL
+    happened_on mmddyyyy NOT NULL
 );
 
 CREATE INDEX events_date_btree ON events (happened_on);
@@ -199,14 +234,14 @@ WHERE happened_on >= '09/01/2026'
 ```
 
 Because no operator class is named in `CREATE INDEX`, PostgreSQL selects the
-default `mdydate_btree_ops`. During index construction, insertion, lookup, and
-range scans, the B-tree calls `mdydate_cmp` to decide which key is smaller and
+default `mmddyyyy_btree_ops`. During index construction, insertion, lookup, and
+range scans, the B-tree calls `mmddyyyy_cmp` to decide which key is smaller and
 which branch to follow. The stored datum still begins with the month; its
 physical byte layout does not determine its logical sort order.
 
 So "ordinary" referred only to the SQL interface. The ordering is custom. A
 clearer description is: **an ordinary PostgreSQL B-tree using the custom
-chronological operator class of the native `mdydate` type.**
+chronological operator class of the native `mmddyyyy` type.**
 
 ### From ordering to containment
 
@@ -225,13 +260,13 @@ WHERE happened_on <@ '09/*/*';
 ```
 
 Read this initially as **"`happened_on` is contained in the set of dates
-described by `09/*/*`."** The left operand is one `mdydate`; the right operand
-is an `mdypattern` describing many possible dates. The next section defines
+described by `09/*/*`."** The left operand is one `mmddyyyy`; the right operand
+is an `mmddyyyy_pattern` describing many possible dates. The next section defines
 that pattern language and the containment rule precisely.
 
 ## 4. What exactly does `<@` mean?
 
-`mdypattern` is a second type used for questions. It has the same three
+`mmddyyyy_pattern` is a second type used for questions. It has the same three
 positions, but `*` means "this component is unconstrained":
 
 | Pattern | Set of dates described |
@@ -249,14 +284,14 @@ The symbol follows PostgreSQL's usual containment direction. Read
 pattern."**
 
 ```sql
-SELECT '09/15/2026'::mdydate <@ '09/*/*'::mdypattern; -- true
-SELECT '09/15/2026'::mdydate <@ '*/15/*'::mdypattern; -- true
-SELECT '09/15/2026'::mdydate <@ '10/*/*'::mdypattern; -- false
+SELECT '09/15/2026'::mmddyyyy <@ '09/*/*'::mmddyyyy_pattern; -- true
+SELECT '09/15/2026'::mmddyyyy <@ '*/15/*'::mmddyyyy_pattern; -- true
+SELECT '09/15/2026'::mmddyyyy <@ '10/*/*'::mmddyyyy_pattern; -- false
 ```
 
 This is component equality with omitted constraints. It is not `LIKE`, a text
 prefix, a chronological range, or "earlier than." The `*` is parsed into a
-mask inside `mdypattern`; it is not a SQL wildcard.
+mask inside `mmddyyyy_pattern`; it is not a SQL wildcard.
 
 One GiST index supports every component combination:
 
@@ -322,37 +357,38 @@ therefore not an independent upper bound on every descendant.
 
 That is what "a B-tree has only one range" means here. It has one range in the
 total order defined by `(month, day, year)`. `month = 9` maps to one contiguous
-slice and works beautifully. `day = 15` maps to separate slices under every
-month. `day = 15 AND year = 2026` is still disconnected along that ordered
+slice and works beautifully. `day = 15` maps to a separate slice within each
+month range. `day = 15 AND year = 2026` is still disconnected along that ordered
 line. In PostgreSQL 17, our one B-tree scans broadly for those predicates. A
 GiST box can test day and year directly at every level because they remain
 separate dimensions.
 
-This is not free superiority. A B-tree has nonoverlapping ordered ranges and
-usually follows one narrow path for an exact fully constrained key. GiST boxes
-can overlap, so GiST may need to follow several paths. The benefit is accepting
-many shapes of multidimensional question through one index.
+This is not an unqualified advantage. A B-tree has non-overlapping ordered
+ranges and usually follows one narrow path for an exact key with all components
+constrained. GiST boxes can overlap, so GiST may need to follow several paths.
+The benefit is that one index supports many forms of multidimensional query.
 
 ## 5. Why introduce `<->`? From matching to ranking
 
 `<@` gives a yes-or-no answer: a date either belongs to the pattern's set or it
-does not. It cannot answer the next natural question: **which nonmatching dates
-are most similar?** For example, after `09/15/2026`, should an old September
-date rank before August 15, 2026? The answer depends on the policy we choose.
+does not. It cannot answer the next natural question: **which dates outside the
+set are most similar?** For example, for a query of `09/15/2026`, should an
+older September date rank before August 15, 2026? The answer depends on the
+policy we choose.
 
 The extension makes that policy explicit with a second operator, `<->`, using
 PostgreSQL's familiar spelling for distance:
 
 ```text
-mdydate <-> mdypattern -> double precision
+mmddyyyy <-> mmddyyyy_pattern -> double precision
 ```
 
 Smaller values mean more similar. Zero means the date agrees with every
 component constrained by the pattern. Unlike `<@`, distance gives all rows an
-ordering rather than splitting them into only matches and nonmatches.
+ordering rather than dividing them by whether they match.
 
-This enables **k-nearest-neighbor (KNN) search**: return the `k` rows having
-the smallest distance from a query value. SQL expresses `k` with `LIMIT`:
+This enables **k-nearest-neighbor (KNN) search**, which returns the `k` rows
+with the smallest distance from a query value. SQL expresses `k` with `LIMIT`:
 
 ```sql
 SELECT happened_on,
@@ -393,9 +429,9 @@ The weights create strict significance levels:
 - every year difference costs less than `1`.
 
 Month therefore dominates day, and day dominates year. December and January
-are adjacent. An old date in the same month can rank before the same day in an
-adjacent month. That is intentional: this is similarity, not elapsed time.
-Cast to `date` and subtract for elapsed days.
+are adjacent. A date in the same month but a distant year can rank before the
+corresponding day in an adjacent month. That is intentional: this is similarity,
+not elapsed time. Cast to `date` and subtract for elapsed days.
 
 Wildcards contribute zero. Distance from `09/*/*` asks only how far a value's
 month is from September; day and year do not participate.
@@ -459,13 +495,13 @@ the index, but on PostgreSQL 17 it cannot turn that predicate into one narrow
 start/stop interval. GiST has no leftmost-prefix rule because every internal box
 records independent bounds for all three dimensions.
 
-### Mapping `mdydate` onto GiST
+### Mapping `mmddyyyy` onto GiST
 
 The public value and GiST key are deliberately different:
 
 ```mermaid
 flowchart LR
-  Input["input 09/15/2026"] --> Parse["mdydate_in validates"]
+  Input["input 09/15/2026"] --> Parse["mmddyyyy_in validates"]
   Parse --> Heap["heap: 10 text bytes"]
   Heap --> Btree["B-tree: comparator decodes Y/M/D"]
   Heap --> Compress["GiST compress"]
@@ -512,30 +548,30 @@ TIDs point to table tuples.
 
 ### Fixed-size structures
 
-The C implementation in [src/mdydate.c](src/mdydate.c) uses:
+The C implementation in [src/mmddyyyy.c](src/mmddyyyy.c) uses:
 
 | Structure | Size | Contents |
 | --- | ---: | --- |
-| `MdyDate` | 10 bytes | The characters `MM/DD/YYYY`, without a trailing NUL |
-| `MdyPattern` | 6 bytes | `int16` year, byte month/day, and a present-field mask |
-| `MdyGistKey` | 8 bytes | Lower and upper bounds for month, day, and year |
+| `MmDdYyyy` | 10 bytes | The characters `MM/DD/YYYY`, without a trailing NUL |
+| `MmDdYyyyPattern` | 6 bytes | `int16` year, byte month/day, and a present-field mask |
+| `MmDdYyyyGistKey` | 8 bytes | Lower and upper bounds for month, day, and year |
 
 Compile-time assertions synchronize those layouts with the SQL
 `INTERNALLENGTH` declarations in
-[sql/mdydate--0.1.0.sql](sql/mdydate--0.1.0.sql).
+[sql/mmddyyyy--0.1.0.sql](sql/mmddyyyy--0.1.0.sql).
 
-`mdydate_in` checks the separators and digits, validates Gregorian rules, then
-copies the ten original bytes. `mdydate_out` adds a temporary NUL only for the
+`mmddyyyy_in` checks the separators and digits, validates Gregorian rules, then
+copies the ten original bytes. `mmddyyyy_out` adds a temporary NUL only for the
 text protocol. Casts use PostgreSQL's `date2j` and `j2date` routines; converting
 from `date` reconstructs canonical zero-padded text.
 
-`mdydate_cmp` decodes both values and compares year, month, day. The SQL script
+`mmddyyyy_cmp` decodes both values and compares year, month, day. The SQL script
 registers its six operators as a complete B-tree family, so PostgreSQL supplies
 normal equality, range, merge, and ordered scans.
 
-`mdypattern_in` parses each number or `*`; its mask distinguishes an absent
+`mmddyyyy_pattern_in` parses each number or `*`; its mask distinguishes an absent
 component from numeric zero. Patterns are validated as sets: `02/29/*` is
-nonempty, but `02/30/*` is impossible and rejected. `mdydate_matches`, exposed
+nonempty, but `02/30/*` is impossible and rejected. `mmddyyyy_matches`, exposed
 as `<@`, checks only components selected by that mask.
 
 ### GiST callbacks
@@ -572,10 +608,10 @@ For each inserted date:
   creates a new tree level.
 
 This extension defines box span as month width weighted by 32, plus day width,
-plus a year width bounded below 1. Thus `penalty` strongly prefers keeping
-months together. `picksplit` chooses the first dimension that varies in the
-priority month, day, year, sorts entries by that dimension's center, and splits
-at the median. That policy is simple enough to teach, but it can produce
+plus a year width that remains below 1. Thus `penalty` strongly prefers keeping
+months together. `picksplit` chooses the first varying dimension in the priority
+order: month, day, then year. It sorts entries by that dimension's center and
+splits at the median. That policy is simple enough to teach, but it can produce
 overlapping boxes and is not claimed to be an optimal R-tree split.
 
 The opclass does not implement GiST `sortsupport`. PostgreSQL therefore builds
@@ -587,7 +623,7 @@ seconds. Build cost is one of the tradeoffs, not an incidental detail.
 
 For `happened_on <@ '*/15/2026'`, PostgreSQL performs this tree walk:
 
-1. `mdypattern_in` produces `month = unconstrained`, `day = 15`,
+1. `mmddyyyy_pattern_in` produces `month = unconstrained`, `day = 15`,
   `year = 2026`.
 2. The scan reads root block 0 and calls `consistent` for every root tuple.
 3. Month bounds are ignored because month is a wildcard.
@@ -615,9 +651,9 @@ iterative, buffered index scan and integrates MVCC visibility through heap
 fetches or the visibility map for index-only scans.
 
 `consistent = true` on an internal box means only "worth visiting." On a lossy
-GiST, a leaf match may also be only a candidate and PostgreSQL rechecks the
-operator against the heap tuple. This extension stores exact point leaves, so
-its leaf result is definitive.
+GiST, a leaf match may be only a candidate, and PostgreSQL rechecks the operator
+against the heap tuple. This extension stores exact point leaves, so its leaf
+result is definitive.
 
 ### How KNN `<->` is scanned
 
@@ -656,15 +692,15 @@ day from `01/01/0001` through `12/31/9999`: **3,652,059 rows**. It creates one
 compound B-tree and one GiST:
 
 ```sql
-CREATE INDEX calendar_days_mdy_btree
+CREATE INDEX calendar_days_mmddyyyy_btree
 ON calendar_days (
-    mdydate_month(happened_on),
-    mdydate_day(happened_on),
-    mdydate_year(happened_on)
+    mmddyyyy_month(happened_on),
+    mmddyyyy_day(happened_on),
+    mmddyyyy_year(happened_on)
 )
 INCLUDE (happened_on);
 
-CREATE INDEX calendar_days_mdy_gist
+CREATE INDEX calendar_days_mmddyyyy_gist
 ON calendar_days USING gist (happened_on);
 ```
 
@@ -743,7 +779,7 @@ Run the shorter narrated comparison in [lab/demo.sql](lab/demo.sql):
 docker compose build
 docker compose up -d --wait
 MSYS_NO_PATHCONV=1 docker compose exec -T postgres \
-  psql -X -U postgres -d mdydate_lab -f /project/lab/demo.sql
+  psql -X -U postgres -d mmddyyyy_lab -f /project/lab/demo.sql
 docker compose down -v
 ```
 
@@ -780,11 +816,19 @@ multi-page, WAL-logged PostgreSQL GiST index.
 
 ## Research sources
 
-- [ISO 8601](https://www.iso.org/iso-8601-date-and-time-format.html): the international `YYYY-MM-DD` standard.
-- [W3C date formats](https://www.w3.org/International/questions/qa-date-format.en.html): locale ambiguity and US `MM/DD/YY`.
-- [Unicode CLDR patterns](https://cldr.unicode.org/translation/date-time/date-time-patterns): locale-sensitive date patterns.
-- [Declaration transcript](https://www.archives.gov/founding-docs/declaration-transcript): "July 4, 1776."
-- [Constitution transcript](https://www.archives.gov/founding-docs/constitution-transcript): "the Seventeenth Day of September ... 1787."
-- [MIT on US date format](https://iso.mit.edu/americanisms/date-format-in-the-united-states/): present convention and a tentative British-inheritance hypothesis.
-- [PostgreSQL 17 GiST documentation](https://www.postgresql.org/docs/17/gist.html): access-method and operator-class contracts.
-- [PostgreSQL 17 `pageinspect`](https://www.postgresql.org/docs/17/pageinspect.html): direct inspection of B-tree and GiST pages.
+- [ISO 8601](https://www.iso.org/iso-8601-date-and-time-format.html): the
+  international `YYYY-MM-DD` standard.
+- [W3C date formats](https://www.w3.org/International/questions/qa-date-format.en.html):
+  locale ambiguity and US `MM/DD/YY`.
+- [Unicode CLDR patterns](https://cldr.unicode.org/translation/date-time/date-time-patterns):
+  locale-sensitive date patterns.
+- [Declaration transcript](https://www.archives.gov/founding-docs/declaration-transcript):
+  "July 4, 1776."
+- [Constitution transcript](https://www.archives.gov/founding-docs/constitution-transcript):
+  "the Seventeenth Day of September ... 1787."
+- [MIT on US date format](https://iso.mit.edu/americanisms/date-format-in-the-united-states/):
+  present convention and a tentative British-inheritance hypothesis.
+- [PostgreSQL 17 GiST documentation](https://www.postgresql.org/docs/17/gist.html):
+  access-method and operator-class contracts.
+- [PostgreSQL 17 `pageinspect`](https://www.postgresql.org/docs/17/pageinspect.html):
+  direct inspection of B-tree and GiST pages.

@@ -1,8 +1,8 @@
 \set ON_ERROR_STOP 1
 \pset pager off
 
-DROP EXTENSION IF EXISTS mdydate CASCADE;
-CREATE EXTENSION mdydate;
+DROP EXTENSION IF EXISTS mmddyyyy CASCADE;
+CREATE EXTENSION mmddyyyy;
 
 DO $assert$
 DECLARE
@@ -13,44 +13,44 @@ BEGIN
     SELECT typlen, typalign, typstorage
     INTO type_length, type_alignment, type_storage
     FROM pg_type
-    WHERE oid = 'mdydate'::regtype;
+    WHERE oid = 'mmddyyyy'::regtype;
 
     IF type_length <> 10 OR type_alignment <> 'c' OR type_storage <> 'p' THEN
-        RAISE EXCEPTION 'unexpected mdydate layout: length %, alignment %, storage %',
+        RAISE EXCEPTION 'unexpected mmddyyyy layout: length %, alignment %, storage %',
             type_length, type_alignment, type_storage;
     END IF;
 
-    IF pg_column_size('09/15/2026'::mdydate) <> 10 THEN
-        RAISE EXCEPTION 'mdydate payload is not exactly 10 bytes';
+    IF pg_column_size('09/15/2026'::mmddyyyy) <> 10 THEN
+        RAISE EXCEPTION 'mmddyyyy payload is not exactly 10 bytes';
     END IF;
 
-    IF '09/15/2026'::mdydate::date <> date '2026-09-15' OR
-         date '2000-02-29'::mdydate::date <> date '2000-02-29' OR
-       '01/01/0001'::mdydate::date <> date '0001-01-01' OR
-       '12/31/9999'::mdydate::date <> date '9999-12-31' THEN
+    IF '09/15/2026'::mmddyyyy::date <> date '2026-09-15' OR
+         date '2000-02-29'::mmddyyyy::date <> date '2000-02-29' OR
+       '01/01/0001'::mmddyyyy::date <> date '0001-01-01' OR
+       '12/31/9999'::mmddyyyy::date <> date '9999-12-31' THEN
         RAISE EXCEPTION 'date casts did not round trip';
     END IF;
 
-     IF NOT ('12/31/2026'::mdydate < '01/01/2027'::mdydate) OR
-         NOT ('01/01/2027'::mdydate > '09/15/2026'::mdydate) THEN
+     IF NOT ('12/31/2026'::mmddyyyy < '01/01/2027'::mmddyyyy) OR
+         NOT ('01/01/2027'::mmddyyyy > '09/15/2026'::mmddyyyy) THEN
         RAISE EXCEPTION 'B-tree comparison is not chronological';
     END IF;
 
-     IF NOT ('09/15/2026'::mdydate <@ '09/*/*'::mdypattern) OR
-         NOT ('09/15/2026'::mdydate <@ '*/15/*'::mdypattern) OR
-         '09/15/2026'::mdydate <@ '10/*/*'::mdypattern THEN
+     IF NOT ('09/15/2026'::mmddyyyy <@ '09/*/*'::mmddyyyy_pattern) OR
+         NOT ('09/15/2026'::mmddyyyy <@ '*/15/*'::mmddyyyy_pattern) OR
+         '09/15/2026'::mmddyyyy <@ '10/*/*'::mmddyyyy_pattern THEN
         RAISE EXCEPTION 'pattern matching returned an incorrect result';
     END IF;
 
     BEGIN
-        PERFORM '02/29/2025'::mdydate;
+        PERFORM '02/29/2025'::mmddyyyy;
         RAISE EXCEPTION 'nonexistent date was accepted';
     EXCEPTION
         WHEN datetime_field_overflow THEN NULL;
     END;
 
     BEGIN
-        PERFORM '02/30/*'::mdypattern;
+        PERFORM '02/30/*'::mmddyyyy_pattern;
         RAISE EXCEPTION 'impossible partial date was accepted';
     EXCEPTION
         WHEN invalid_datetime_format THEN NULL;
@@ -60,11 +60,11 @@ $assert$;
 
 CREATE TABLE events (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    happened_on mdydate NOT NULL
+    happened_on mmddyyyy NOT NULL
 );
 
 INSERT INTO events (happened_on)
-SELECT generated_at::date::mdydate
+SELECT generated_at::date::mmddyyyy
 FROM generate_series(
     date '1900-01-01',
     date '2099-12-31',
@@ -102,18 +102,18 @@ BEGIN
         RAISE EXCEPTION 'expected 49 leap days, got %', actual;
     END IF;
 
-     IF ('09/01/1900'::mdydate <-> '09/01/2099'::mdypattern) >=
-         ('08/01/2099'::mdydate <-> '09/01/2099'::mdypattern) THEN
+     IF ('09/01/1900'::mmddyyyy <-> '09/01/2099'::mmddyyyy_pattern) >=
+         ('08/01/2099'::mmddyyyy <-> '09/01/2099'::mmddyyyy_pattern) THEN
         RAISE EXCEPTION 'month does not dominate year in the distance metric';
     END IF;
 
-     IF ('09/01/1900'::mdydate <-> '09/01/2099'::mdypattern) >=
-         ('09/02/2099'::mdydate <-> '09/01/2099'::mdypattern) THEN
+     IF ('09/01/1900'::mmddyyyy <-> '09/01/2099'::mmddyyyy_pattern) >=
+         ('09/02/2099'::mmddyyyy <-> '09/01/2099'::mmddyyyy_pattern) THEN
         RAISE EXCEPTION 'day does not dominate year in the distance metric';
     END IF;
 
-     IF ('12/15/2026'::mdydate <-> '01/15/2026'::mdypattern) <>
-         ('02/15/2026'::mdydate <-> '01/15/2026'::mdypattern) THEN
+     IF ('12/15/2026'::mmddyyyy <-> '01/15/2026'::mmddyyyy_pattern) <>
+         ('02/15/2026'::mmddyyyy <-> '01/15/2026'::mmddyyyy_pattern) THEN
         RAISE EXCEPTION 'month distance is not circular around January';
     END IF;
 END
@@ -159,16 +159,16 @@ $assert$;
 
 CREATE TEMP TABLE knn_index AS
 SELECT happened_on::date AS happened_on,
-    happened_on <-> '09/01/2099'::mdypattern AS distance
+    happened_on <-> '09/01/2099'::mmddyyyy_pattern AS distance
 FROM events
-ORDER BY happened_on <-> '09/01/2099'::mdypattern
+ORDER BY happened_on <-> '09/01/2099'::mmddyyyy_pattern
 LIMIT 50;
 
 CREATE TEMP TABLE knn_partial_index AS
 SELECT happened_on::date AS happened_on,
-    happened_on <-> '09/*/2099'::mdypattern AS distance
+    happened_on <-> '09/*/2099'::mmddyyyy_pattern AS distance
 FROM events
-ORDER BY happened_on <-> '09/*/2099'::mdypattern
+ORDER BY happened_on <-> '09/*/2099'::mmddyyyy_pattern
 LIMIT 60;
 
 SET enable_seqscan = on;
@@ -178,16 +178,16 @@ SET enable_bitmapscan = off;
 
 CREATE TEMP TABLE knn_sequential AS
 SELECT happened_on::date AS happened_on,
-    happened_on <-> '09/01/2099'::mdypattern AS distance
+    happened_on <-> '09/01/2099'::mmddyyyy_pattern AS distance
 FROM events
-ORDER BY happened_on <-> '09/01/2099'::mdypattern
+ORDER BY happened_on <-> '09/01/2099'::mmddyyyy_pattern
 LIMIT 50;
 
 CREATE TEMP TABLE knn_partial_sequential AS
 SELECT happened_on::date AS happened_on,
-    happened_on <-> '09/*/2099'::mdypattern AS distance
+    happened_on <-> '09/*/2099'::mmddyyyy_pattern AS distance
 FROM events
-ORDER BY happened_on <-> '09/*/2099'::mdypattern
+ORDER BY happened_on <-> '09/*/2099'::mmddyyyy_pattern
 LIMIT 60;
 
 DO $assert$
@@ -219,4 +219,4 @@ RESET enable_indexscan;
 RESET enable_indexonlyscan;
 RESET enable_bitmapscan;
 
-SELECT 'PASS: mdydate base type, B-tree, multi-page GiST, patterns, and KNN' AS result;
+SELECT 'PASS: mmddyyyy base type, B-tree, multi-page GiST, patterns, and KNN' AS result;

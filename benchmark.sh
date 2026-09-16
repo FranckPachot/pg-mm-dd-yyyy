@@ -13,5 +13,5 @@ docker compose down -v --remove-orphans
 docker compose build
 docker compose up -d --wait
 MSYS_NO_PATHCONV=1 docker compose exec -T postgres \
-  psql -X -v ON_ERROR_STOP=1 -U postgres -d mdydate_lab \
+  psql -X -v ON_ERROR_STOP=1 -U postgres -d mmddyyyy_lab \
   -f /project/lab/compare-indexes.sql

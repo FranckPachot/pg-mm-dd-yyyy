@@ -25,7 +25,7 @@ try {
     Invoke-Compose -Arguments @(
         'exec', '-T', 'postgres',
         'psql', '-X', '-v', 'ON_ERROR_STOP=1',
-        '-U', 'postgres', '-d', 'mdydate_lab',
+        '-U', 'postgres', '-d', 'mmddyyyy_lab',
         '-f', '/project/lab/compare-indexes.sql'
     )
 }

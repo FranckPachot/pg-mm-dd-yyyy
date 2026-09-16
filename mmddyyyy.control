@@ -1,4 +1,4 @@
 comment = 'Text-backed MM/DD/YYYY dates with B-tree and GiST indexing'
 default_version = '0.1.0'
-module_pathname = '$libdir/mdydate'
+module_pathname = '$libdir/mmddyyyy'
 relocatable = true
